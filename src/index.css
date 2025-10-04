@@ -1,0 +1,30 @@
+html, body, #root { height: 100%; margin: 0; }
+* { box-sizing: border-box; }
+
+/* Harita içinde seçim/jestleri azalt */
+.leaflet-container {
+  user-select: none;
+  -webkit-user-select: none;
+  -ms-user-select: none;
+  touch-action: none;
+}
+
+.seg { vector-effect: non-scaling-stroke; }
+.seg-done {
+  filter: drop-shadow(0 0 6px rgba(34,197,94,0.85)) drop-shadow(0 0 12px rgba(34,197,94,0.45));
+}
+.seg-hover {
+  filter: drop-shadow(0 0 6px rgba(0,0,0,0.45)) drop-shadow(0 0 10px rgba(0,0,0,0.25));
+}
+.seg-inprog {
+  filter: drop-shadow(0 0 4px rgba(245,158,11,0.6));
+}
+
+.kpi-box { padding: 8px; border: 1px solid #e5e7eb; border-radius: 8px; }
+.kpi-label { opacity: .7; }
+.kpi-value { font-weight: 700; }
+.kpi-done { color: #16a34a; }
+.kpi-inprog { color: #f59e0b; }
+
+/* (Opsiyonel) arka plan çizgi sınıfı */
+.bg-line { vector-effect: non-scaling-stroke;}
