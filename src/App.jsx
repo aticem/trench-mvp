@@ -2,46 +2,46 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { MapContainer, GeoJSON, useMap, useMapEvent, Pane } from 'react-leaflet'
 import 'leaflet/dist/leaflet.css'
-import { bbox as turfBbox } from '@turf/turf'
+import { bbox as turfBbox, distance as turfDistance, point as turfPoint } from '@turf/turf'
 import RBush from 'rbush'
 
 const LS_KEY = 'trench-mvp-geojson-v3'
 const PIXEL_TOLERANCE = 140 // px — zoom’dan bağımsız yakınlık eşiği
 
 // ====== Geometry helpers (pixel-space distance) ======
-function distPointToSegment(p, a, b){
+function distPointToSegment(p, a, b) {
   const vx = b.x - a.x, vy = b.y - a.y
   const wx = p.x - a.x, wy = p.y - a.y
-  const len2 = vx*vx + vy*vy
+  const len2 = vx * vx + vy * vy
   if (len2 === 0) return Math.hypot(p.x - a.x, p.y - a.y)
-  let t = (wx*vx + wy*vy) / len2
+  let t = (wx * vx + wy * vy) / len2
   t = Math.max(0, Math.min(1, t))
-  const projx = a.x + t*vx, projy = a.y + t*vy
+  const projx = a.x + t * vx, projy = a.y + t * vy
   return Math.hypot(p.x - projx, p.y - projy)
 }
-function toXY(map, lat, lng){
-  const pt = map.latLngToContainerPoint({lat, lng})
+function toXY(map, lat, lng) {
+  const pt = map.latLngToContainerPoint({ lat, lng })
   return { x: pt.x, y: pt.y }
 }
-function pixelDistancePointToFeature(map, latlng, feature){
+function pixelDistancePointToFeature(map, latlng, feature) {
   const p = toXY(map, latlng.lat, latlng.lng)
   const geom = feature.geometry
   let minD = Infinity
 
   if (geom?.type === 'LineString') {
     const c = geom.coordinates || []
-    for (let i=0; i<c.length-1; i++){
+    for (let i = 0; i < c.length - 1; i++) {
       const a = toXY(map, c[i][1], c[i][0])
-      const b = toXY(map, c[i+1][1], c[i+1][0])
+      const b = toXY(map, c[i + 1][1], c[i + 1][0])
       const d = distPointToSegment(p, a, b)
       if (d < minD) minD = d
       if (d <= PIXEL_TOLERANCE) return d
     }
   } else if (geom?.type === 'MultiLineString') {
-    for (const part of (geom.coordinates || [])){
-      for (let i=0; i<part.length-1; i++){
+    for (const part of (geom.coordinates || [])) {
+      for (let i = 0; i < part.length - 1; i++) {
         const a = toXY(map, part[i][1], part[i][0])
-        const b = toXY(map, part[i+1][1], part[i+1][0])
+        const b = toXY(map, part[i + 1][1], part[i + 1][0])
         const d = distPointToSegment(p, a, b)
         if (d < minD) minD = d
         if (d <= PIXEL_TOLERANCE) return d
@@ -50,86 +50,138 @@ function pixelDistancePointToFeature(map, latlng, feature){
   }
   return minD
 }
-function pxToMeters(map, latlng, px=PIXEL_TOLERANCE){
+function pxToMeters(map, latlng, px = PIXEL_TOLERANCE) {
   const p = map.latLngToContainerPoint(latlng)
   const p2 = { x: p.x + px, y: p.y }
   const ll2 = map.containerPointToLatLng(p2)
   return map.distance(latlng, ll2)
 }
-function metersToDegreeBox(centerLat, radiusM, inflate=2.2){
+function metersToDegreeBox(centerLat, radiusM, inflate = 2.2) {
   const latDeg = (radiusM / 110540) * inflate
-  const lonDeg = (radiusM / (111320 * Math.max(Math.cos(centerLat * Math.PI/180), 0.01))) * inflate
+  const lonDeg = (radiusM / (111320 * Math.max(Math.cos(centerLat * Math.PI / 180), 0.01))) * inflate
   return { latDeg, lonDeg }
 }
-function pickNearestFeature(map, latlng, allFeatures, spatialIndex){
+function pickNearestFeature(map, latlng, allFeatures, spatialIndex) {
   let candidates = []
-  if (spatialIndex){
+  if (spatialIndex) {
     const radiusM = pxToMeters(map, latlng, PIXEL_TOLERANCE)
     const { latDeg, lonDeg } = metersToDegreeBox(latlng.lat, radiusM, 2.2)
     const minX = latlng.lng - lonDeg, maxX = latlng.lng + lonDeg
     const minY = latlng.lat - latDeg, maxY = latlng.lat + latDeg
-    const hits = spatialIndex.search({minX, minY, maxX, maxY})
-    candidates = (hits && hits.length) ? hits.map(h=>h.feature) : (allFeatures || [])
+    const hits = spatialIndex.search({ minX, minY, maxX, maxY })
+    candidates = (hits && hits.length) ? hits.map(h => h.feature) : (allFeatures || [])
   } else {
     candidates = allFeatures || []
   }
 
   let best = null, bestD = Infinity
-  for (const f of candidates){
+  for (const f of candidates) {
     const dpx = pixelDistancePointToFeature(map, latlng, f)
-    if (dpx < bestD){ bestD = dpx; best = f }
+    if (dpx < bestD) { bestD = dpx; best = f }
   }
   return { feature: best, dpx: bestD }
 }
 
 // ====== GeoJSON normalize ======
-function normalizeGeoJSON(j){
-  const feats=(j.features||[]).map((f,i)=>{
-    const p={...(f.properties||{})}
-    const id=p.id ?? `SEG_${i}`
-    const lineId=p.lineId ?? 'L0'
-    const meters =
-      (typeof p.meters === 'number' && !isNaN(p.meters)) ? p.meters :
-      (typeof p.length_m === 'number' && !isNaN(p.length_m)) ? p.length_m :
-      0
-    const status=p.status ?? 'todo'
-    let start=null,end=null
-    if(f.geometry?.type==='LineString' && f.geometry.coordinates?.length>=2){
-      const c=f.geometry.coordinates
-      start=c[0]; end=c[c.length-1]
-    } else if (f.geometry?.type==='MultiLineString' && f.geometry.coordinates?.[0]?.length>=2){
-      const c=f.geometry.coordinates[0]
-      start=c[0]; end=c[c.length-1]
+
+// ====== GeoJSON normalize & Grouping ======
+// ====== GeoJSON normalize & Grouping ======
+function normalizeGeoJSON(j) {
+  // 1. Filter: Keep only 'trenches' layer
+  const rawFeats = (j.features || []).filter(f => f.properties?.layer === 'trenches')
+
+  // 2. Grouping: Identify parallel lines (trench sides)
+  // Threshold: 2.0 meters (0.002 km) to be safe for wider trenches
+  const THRESHOLD_KM = 0.002
+
+  const assigned = new Set() // set of indices
+  const groups = [] // array of arrays of features
+
+  for (let i = 0; i < rawFeats.length; i++) {
+    if (assigned.has(i)) continue
+    const f1 = rawFeats[i]
+    const group = [f1]
+    assigned.add(i)
+
+    // Simple centroid/midpoint for f1
+    const c1 = f1.geometry.coordinates
+    const p1_start = c1 && c1.length > 0 ? c1[0] : null
+    const p1_end = c1 && c1.length > 0 ? c1[c1.length - 1] : null
+    if (!p1_start) continue
+
+    for (let k = i + 1; k < rawFeats.length; k++) {
+      if (assigned.has(k)) continue
+      const f2 = rawFeats[k]
+      const c2 = f2.geometry.coordinates
+      const p2_start = c2 && c2.length > 0 ? c2[0] : null
+      const p2_end = c2 && c2.length > 0 ? c2[c2.length - 1] : null
+      if (!p2_start) continue
+
+      // Check distance between start points (approx)
+      // Check both normal direction (start-start) and reversed (start-end)
+      const d_normal = turfDistance(turfPoint(p1_start), turfPoint(p2_start), { units: 'kilometers' })
+      const d_reverse = turfDistance(turfPoint(p1_start), turfPoint(p2_end), { units: 'kilometers' })
+
+      // If close in either configuration, assume same trench group
+      if (d_normal < THRESHOLD_KM || d_reverse < THRESHOLD_KM) {
+        group.push(f2)
+        assigned.add(k)
+      }
     }
-    const _bbox = turfBbox(f)
-    return {...f, properties:{...p,id,idx:i,lineId,meters,status,_start:start,_end:end,_bbox}}
+    groups.push(group)
+  }
+
+  // 3. Flatten and assign lineIds
+  const feats = []
+  groups.forEach((grp, gIdx) => {
+    const lineId = `G_${gIdx}`
+    // Use the length of the FIRST segment as the logical length for the group
+    const logicalMeters = grp[0].properties?.length_m || grp[0].properties?.meters || 0
+
+    grp.forEach((f, i) => {
+      const p = { ...(f.properties || {}) }
+      const id = p.id ?? `SEG_${gIdx}_${i}`
+      const status = p.status ?? 'todo'
+      const _bbox = turfBbox(f)
+
+      feats.push({
+        ...f,
+        properties: {
+          ...p,
+          id,
+          lineId,
+          meters: logicalMeters, // Each segment carries the group's length info
+          status,
+          _bbox
+        }
+      })
+    })
   })
-  return {type:'FeatureCollection', features:feats}
+
+  return { type: 'FeatureCollection', features: feats }
 }
 
 // ====== MAP HELPERS ======
-function FitToDataOnce({ geojson }){
-  const map=useMap()
+function FitToDataOnce({ geojson }) {
+  const map = useMap()
   const didFitRef = useRef(false)
-  useEffect(()=>{
-    if(didFitRef.current) return
-    if(!geojson?.features?.length) return
-    try{
-      const [minX,minY,maxX,maxY]=turfBbox(geojson)
-      map.fitBounds([[minY,minX],[maxY,maxX]],{padding:[48,48]})
+  useEffect(() => {
+    if (didFitRef.current) return
+    if (!geojson?.features?.length) return
+    try {
+      const [minX, minY, maxX, maxY] = turfBbox(geojson)
+      map.fitBounds([[minY, minX], [maxY, maxX]], { padding: [48, 48] })
       didFitRef.current = true
-    }catch{}
-  },[geojson,map])
+    } catch { }
+  }, [geojson, map])
   return null
 }
 
 // Middle mouse = pan
-
-// Orta tuş: custom pan (dragging kullanmadan)
-function MiddleMousePan(){
+function MiddleMousePan() {
   const map = useMap()
   const isPanningRef = useRef(false)
-  const lastRef = useRef({x:0, y:0})
+  const lastRef = useRef({ x: 0, y: 0 })
 
   useEffect(() => {
     const el = map.getContainer()
@@ -148,7 +200,6 @@ function MiddleMousePan(){
       const dx = e.clientX - lastRef.current.x
       const dy = e.clientY - lastRef.current.y
       if (dx !== 0 || dy !== 0) {
-        // ekran pikselini harita pan’ına çevir
         map.panBy([-dx, -dy], { animate: false })
         lastRef.current = { x: e.clientX, y: e.clientY }
       }
@@ -160,7 +211,6 @@ function MiddleMousePan(){
       el.style.cursor = ''
     }
 
-    // bazı tarayıcılarda orta tık "autoscroll" açar → yut
     const swallowAuxClick = (e) => {
       if (e.button === 1) { e.preventDefault(); e.stopPropagation() }
     }
@@ -183,125 +233,124 @@ function MiddleMousePan(){
   return null
 }
 
-
-
-
 // Kill browser defaults (contextmenu vs.)
-function KillBrowserDefaults(){
+function KillBrowserDefaults() {
   const map = useMap()
-  useEffect(()=>{
+  useEffect(() => {
     const el = map.getContainer()
-    const prevent = (e)=>{ e.preventDefault(); e.stopPropagation() }
+    const prevent = (e) => { e.preventDefault(); e.stopPropagation() }
     el.addEventListener('contextmenu', prevent)
     el.addEventListener('selectstart', prevent)
     el.addEventListener('dragstart', prevent)
     el.addEventListener('gesturestart', prevent)
-    return ()=>{
+    return () => {
       el.removeEventListener('contextmenu', prevent)
       el.removeEventListener('selectstart', prevent)
       el.removeEventListener('dragstart', prevent)
       el.removeEventListener('gesturestart', prevent)
     }
-  },[map])
+  }, [map])
   return null
 }
 
 // Hover (proximity)
-function MapHoverProximity({ setHoverId, features, spatialIndex }){
+// Hover (proximity)
+function MapHoverProximity({ setHoverId, features, spatialIndex }) {
   const map = useMap()
-  useMapEvent('mousemove', (e)=>{
+  useMapEvent('mousemove', (e) => {
     const { feature, dpx } = pickNearestFeature(map, e.latlng, features, spatialIndex)
     if (feature && dpx <= PIXEL_TOLERANCE) setHoverId(feature.properties.id)
     else setHoverId(null)
   })
-  useMapEvent('mouseout', ()=> setHoverId(null))
+  useMapEvent('mouseout', () => setHoverId(null))
   return null
 }
 
-// Unified Brush
-function MapBrushUnified({ setStatusById, features, spatialIndex }){
+// Unified Brush with Interpolation
+function MapBrushUnified({ setStatusById, features, spatialIndex }) {
   const map = useMap()
   const isDownRef = useRef(false)
   const downButtonRef = useRef(0)
   const touchedRef = useRef(new Set())
-  const movedRef = useRef(false)
-  const lastDownLatLngRef = useRef(null)
+  const lastDragLatLngRef = useRef(null)
 
-  useMapEvent('mousedown', (e)=>{
+  const processPoint = (latlng, btn) => {
+    const { feature, dpx } = pickNearestFeature(map, latlng, features, spatialIndex)
+    if (feature && dpx <= PIXEL_TOLERANCE) {
+      const fid = feature.properties.id
+      if (touchedRef.current.has(fid)) return
+
+      if (btn === 0) {
+        // LMB → paint (done)
+        if ((feature.properties.status || 'todo') !== 'done') {
+          setStatusById(fid, 'done')
+        }
+        touchedRef.current.add(fid)
+      } else if (btn === 2) {
+        // RMB → erase (todo)
+        if ((feature.properties.status || 'todo') !== 'todo') {
+          setStatusById(fid, 'todo')
+        }
+        touchedRef.current.add(fid)
+      }
+    }
+  }
+
+  useMapEvent('mousedown', (e) => {
     const ev = e.originalEvent
     if (!ev) return
     downButtonRef.current = ev.button ?? 0
-    movedRef.current = false
-    lastDownLatLngRef.current = e.latlng || null
+    lastDragLatLngRef.current = e.latlng
 
-    if (downButtonRef.current === 1) return // orta: pan
+    if (downButtonRef.current === 1) return // middle: pan
 
     isDownRef.current = true
     touchedRef.current = new Set()
 
-    if (downButtonRef.current === 0){
-      // LMB → sadece paint (done)
-      const { feature, dpx } = pickNearestFeature(map, e.latlng, features, spatialIndex)
-      if (feature && dpx <= PIXEL_TOLERANCE){
-        if ((feature.properties.status||'todo')!=='done'){
-          setStatusById(feature.properties.id, 'done')
-        }
-        touchedRef.current.add(feature.properties.id)
-      }
-      ev.preventDefault(); ev.stopPropagation()
-    }
+    // Process initial click point
+    processPoint(e.latlng, downButtonRef.current)
 
-    if (downButtonRef.current === 2){
-      // RMB → erase (todo)
-      const { feature, dpx } = pickNearestFeature(map, e.latlng, features, spatialIndex)
-      if (feature && dpx <= PIXEL_TOLERANCE){
-        if ((feature.properties.status||'todo')!=='todo'){
-          setStatusById(feature.properties.id, 'todo')
-        }
-        touchedRef.current.add(feature.properties.id)
-      }
-      ev.preventDefault(); ev.stopPropagation()
-    }
+    ev.preventDefault(); ev.stopPropagation()
   })
 
-  useMapEvent('mousemove', (e)=>{
+  useMapEvent('mousemove', (e) => {
     if (!isDownRef.current) return
-    movedRef.current = true
     const btn = downButtonRef.current
-    if (btn === 1) return // orta: pan
-    const { feature, dpx } = pickNearestFeature(map, e.latlng, features, spatialIndex)
-    if (!feature || dpx > PIXEL_TOLERANCE) return
-    if (touchedRef.current.has(feature.properties.id)) return
+    if (btn === 1) return // middle: pan
 
-    if (btn === 0){
-      // LMB drag → paint
-      if ((feature.properties.status||'todo')!=='done'){
-        setStatusById(feature.properties.id,'done')
-      }
-    } else if (btn === 2){
-      // RMB drag → erase
-      if ((feature.properties.status||'todo')!=='todo'){
-        setStatusById(feature.properties.id,'todo')
-      }
+    const currentLatLng = e.latlng
+    const lastLatLng = lastDragLatLngRef.current || currentLatLng
+
+    // Interpolation logic
+    const p1 = map.latLngToContainerPoint(lastLatLng)
+    const p2 = map.latLngToContainerPoint(currentLatLng)
+    const dist = p1.distanceTo(p2)
+    const stepSize = 5 // pixels
+    const steps = Math.ceil(dist / stepSize)
+
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps
+      // Linear interpolation of container points
+      const x = p1.x + (p2.x - p1.x) * t
+      const y = p1.y + (p2.y - p1.y) * t
+      const latlng = map.containerPointToLatLng([x, y])
+      processPoint(latlng, btn)
     }
-    touchedRef.current.add(feature.properties.id)
+
+    lastDragLatLngRef.current = currentLatLng
   })
 
-  useMapEvent('mouseup', ()=>{
+  useMapEvent('mouseup', () => {
     isDownRef.current = false
     downButtonRef.current = 0
     touchedRef.current.clear()
-    movedRef.current = false
-    lastDownLatLngRef.current = null
+    lastDragLatLngRef.current = null
   })
 
   return null
 }
 
-
-
 // ====== STYLES (palette) ======
-// BG lines: subtle slate on dark
 const bgStyleFn = () => ({
   color: '#94a3b8',      // slate-400
   weight: 1.15,
@@ -311,46 +360,44 @@ const bgStyleFn = () => ({
   className: 'bg-line'
 })
 
-// trench palette by status
 const trenchColor = (status) => {
-  if (status === 'done') return '#22c55e'       // emerald-500 (vivid but not neon)
-  if (status === 'in_progress') return '#eab308'// yellow-500 (golden)
-  return '#f59e0b'                              // amber-500 (todo)
+  if (status === 'done') return '#22c55e'       // emerald-500
+  if (status === 'in_progress') return '#eab308'// yellow-500
+  return '#f59e0b'                              // amber-500
 }
 
 // ====== APP ======
-export default function App(){
-  const [data,setData]=useState(null)          // trenches (işaretlenebilir)
+export default function App() {
+  const [data, setData] = useState(null)
   const [dataVersion, setDataVersion] = useState(0)
   const [hoverId, setHoverId] = useState(null)
-  const [bgData, setBgData] = useState(null)  // background (görsel)
+  const [bgData, setBgData] = useState(null)
 
   // initial load
-  useEffect(()=>{
-    const saved=localStorage.getItem(LS_KEY)
-    if(saved){
-      try{ setData(normalizeGeoJSON(JSON.parse(saved))); }catch{}
+  useEffect(() => {
+    const saved = localStorage.getItem(LS_KEY)
+    if (saved) {
+      try { setData(normalizeGeoJSON(JSON.parse(saved))); } catch { }
     } else {
       fetch('/trenches.geojson')
-        .then(r=>r.json())
-        .then(j=>setData(normalizeGeoJSON(j)))
+        .then(r => r.json())
+        .then(j => setData(normalizeGeoJSON(j)))
         .catch(console.error)
     }
 
-    // background yükle
     fetch('/background.geojson')
-      .then(r=>r.json())
-      .then(j=>setBgData(j))
+      .then(r => r.json())
+      .then(j => setBgData(j))
       .catch(console.error)
-  },[])
+  }, [])
 
   // persist
-  useEffect(()=>{
-    if(data) {
+  useEffect(() => {
+    if (data) {
       localStorage.setItem(LS_KEY, JSON.stringify(data))
       setDataVersion(prev => prev + 1)
     }
-  },[data])
+  }, [data])
 
   // RBush
   const spatialIndex = useMemo(() => {
@@ -369,28 +416,38 @@ export default function App(){
   }, [data])
 
   // summary
-  const summary = useMemo(()=>{
-    let total=0, done=0, inprog=0, todo=0
-    for(const f of (data?.features||[])){
+  const summary = useMemo(() => {
+    let total = 0, done = 0, inprog = 0, todo = 0
+
+    // Iterate by unique lineId to avoid double counting
+    const seenLines = new Set()
+
+    for (const f of (data?.features || [])) {
+      const lid = f.properties.lineId
+      if (seenLines.has(lid)) continue // already counted this trench
+      seenLines.add(lid)
+
       const m = Number(f.properties?.meters ?? 0)
-      total+=m
-      const s=f.properties?.status||'todo'
-      if(s==='done') done+=m
-      else if(s==='in_progress') inprog+=m
-      else todo+=m
+      total += m
+
+      // Status is shared across the group, so checking this feature is enough
+      const s = f.properties?.status || 'todo'
+      if (s === 'done') done += m
+      else if (s === 'in_progress') inprog += m
+      else todo += m
     }
-    return { total, done, inprog, todo, remaining: total-done }
-  },[data])
+    return { total, done, inprog, todo, remaining: total - done }
+  }, [data])
 
   // trench style: polished weights + glow
-  const styleFn=(feature)=>{
+  const styleFn = (feature) => {
     const status = feature.properties?.status ?? 'todo'
-    const isHover = hoverId && feature.properties?.id===hoverId
+    const isHover = hoverId && feature.properties?.id === hoverId
     const baseColor = trenchColor(status)
     const w =
       status === 'done' ? (isHover ? 10 : 8) :
-      status === 'in_progress' ? (isHover ? 7 : 5.5) :
-      (isHover ? 6 : 4.5)
+        status === 'in_progress' ? (isHover ? 7 : 5.5) :
+          (isHover ? 6 : 4.5)
 
     const cls =
       'seg ' +
@@ -410,29 +467,39 @@ export default function App(){
     }
   }
 
-  const setStatusById=(id,next)=>setData(prev=>{
-    if(!prev) return prev
-    const feats=prev.features.map(f=>f.properties.id===id?{...f,properties:{...f.properties,status:next}}:f)
-    return {...prev,features:feats}
+  const setStatusById = (id, next) => setData(prev => {
+    if (!prev) return prev
+    // Find the lineId of the clicked segment
+    const clicked = prev.features.find(f => f.properties.id === id)
+    if (!clicked) return prev
+    const targetLineId = clicked.properties.lineId
+
+    // Update ALL segments with that lineId
+    const feats = prev.features.map(f =>
+      f.properties.lineId === targetLineId
+        ? { ...f, properties: { ...f.properties, status: next } }
+        : f
+    )
+    return { ...prev, features: feats }
   })
 
-  const clearAll=()=>setData(prev=>{
-    if(!prev) return prev
-    return {...prev,features:prev.features.map(f=>({...f,properties:{...f.properties,status:'todo'}}))}
+  const clearAll = () => setData(prev => {
+    if (!prev) return prev
+    return { ...prev, features: prev.features.map(f => ({ ...f, properties: { ...f.properties, status: 'todo' } })) }
   })
 
   return (
     <div style={{
-      height:'100vh',
-      width:'100vw',
-      display:'grid',
-      gridTemplateColumns:'1fr 360px',
-      background:'#0b1220', // deep slate/navy
-      color:'#e5e7eb'
+      height: '100vh',
+      width: '100vw',
+      display: 'grid',
+      gridTemplateColumns: '1fr 360px',
+      background: '#0b1220', // deep slate/navy
+      color: '#e5e7eb'
     }}>
       <div>
         <MapContainer
-          center={[52.6,-1.7]}
+          center={[52.6, -1.7]}
           zoom={17}
           minZoom={5}
           maxZoom={22}
@@ -442,10 +509,10 @@ export default function App(){
           doubleClickZoom={false}
           preferCanvas={false}
           style={{
-            height:'100%',
-            width:'100%',
-            background:'#0f172a', // slate-900
-            outline:'1px solid #0b1220'
+            height: '100%',
+            width: '100%',
+            background: '#0f172a', // slate-900
+            outline: '1px solid #0b1220'
           }}
         >
           <KillBrowserDefaults />
@@ -497,92 +564,92 @@ export default function App(){
       </div>
 
       <aside style={{
-        padding:'14px 16px',
-        borderLeft:'1px solid #1e293b',    // slate-800
-        background:'linear-gradient(180deg, #0b1220 0%, #0d1628 100%)',
-        boxShadow:'inset 0 1px 0 rgba(255,255,255,0.02)'
+        padding: '14px 16px',
+        borderLeft: '1px solid #1e293b',    // slate-800
+        background: 'linear-gradient(180deg, #0b1220 0%, #0d1628 100%)',
+        boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.02)'
       }}>
-        <div style={{display:'flex', gap:10, alignItems:'center', marginBottom:12}}>
-          <b style={{fontSize:16, letterSpacing:.2}}>Trench-MVP</b>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginBottom: 12 }}>
+          <b style={{ fontSize: 16, letterSpacing: .2 }}>Trench-MVP</b>
           <span style={{
-            marginLeft:'auto',
-            fontSize:11,
-            opacity:.7,
-            background:'#0f172a',
-            border:'1px solid #1f2937',
-            padding:'4px 8px',
-            borderRadius:999
+            marginLeft: 'auto',
+            fontSize: 11,
+            opacity: .7,
+            background: '#0f172a',
+            border: '1px solid #1f2937',
+            padding: '4px 8px',
+            borderRadius: 999
           }}>Dark</span>
           <button
             onClick={clearAll}
             style={{
-              background:'#0f172a',
-              color:'#e5e7eb',
-              border:'1px solid #334155',
-              borderRadius:10,
-              padding:'6px 12px',
-              cursor:'pointer',
-              transition:'all .15s ease',
-              boxShadow:'0 0 0 0 rgba(0,0,0,0)'
+              background: '#0f172a',
+              color: '#e5e7eb',
+              border: '1px solid #334155',
+              borderRadius: 10,
+              padding: '6px 12px',
+              cursor: 'pointer',
+              transition: 'all .15s ease',
+              boxShadow: '0 0 0 0 rgba(0,0,0,0)'
             }}
-            onMouseOver={e=>{ e.currentTarget.style.borderColor='#475569' }}
-            onMouseOut={e=>{ e.currentTarget.style.borderColor='#334155' }}
+            onMouseOver={e => { e.currentTarget.style.borderColor = '#475569' }}
+            onMouseOut={e => { e.currentTarget.style.borderColor = '#334155' }}
           >
             Clear
           </button>
         </div>
 
         <div style={{
-          display:'grid',
-          gridTemplateColumns:'1fr 1fr',
-          gap:10,
-          marginBottom:14
+          display: 'grid',
+          gridTemplateColumns: '1fr 1fr',
+          gap: 10,
+          marginBottom: 14
         }}>
           <div className="kpi-box" style={{
-            borderColor:'#1f2937', background:'#0f172a', borderRadius:12, padding:10
+            borderColor: '#1f2937', background: '#0f172a', borderRadius: 12, padding: 10
           }}>
-            <div className="kpi-label" style={{color:'#94a3b8'}}>Toplam</div>
-            <div className="kpi-value" style={{fontWeight:700, fontSize:16}}>
+            <div className="kpi-label" style={{ color: '#94a3b8' }}>Toplam</div>
+            <div className="kpi-value" style={{ fontWeight: 700, fontSize: 16 }}>
               {summary.total.toFixed(2)} m
             </div>
           </div>
           <div className="kpi-box" style={{
-            borderColor:'#1f2937', background:'#0f172a', borderRadius:12, padding:10
+            borderColor: '#1f2937', background: '#0f172a', borderRadius: 12, padding: 10
           }}>
-            <div className="kpi-label" style={{color:'#94a3b8'}}>Kalan</div>
-            <div className="kpi-value" style={{fontWeight:700, fontSize:16}}>
+            <div className="kpi-label" style={{ color: '#94a3b8' }}>Kalan</div>
+            <div className="kpi-value" style={{ fontWeight: 700, fontSize: 16 }}>
               {summary.remaining.toFixed(2)} m
             </div>
           </div>
           <div className="kpi-box" style={{
-            borderColor:'#1f2937', background:'#0f172a', borderRadius:12, padding:10
+            borderColor: '#1f2937', background: '#0f172a', borderRadius: 12, padding: 10
           }}>
-            <div className="kpi-label" style={{color:'#94a3b8'}}>Done</div>
-            <div className="kpi-value" style={{fontWeight:700, fontSize:16, color:'#22c55e'}}>
+            <div className="kpi-label" style={{ color: '#94a3b8' }}>Done</div>
+            <div className="kpi-value" style={{ fontWeight: 700, fontSize: 16, color: '#22c55e' }}>
               {summary.done.toFixed(2)} m
             </div>
           </div>
           <div className="kpi-box" style={{
-            borderColor:'#1f2937', background:'#0f172a', borderRadius:12, padding:10
+            borderColor: '#1f2937', background: '#0f172a', borderRadius: 12, padding: 10
           }}>
-            <div className="kpi-label" style={{color:'#94a3b8'}}>In-Prog</div>
-            <div className="kpi-value" style={{fontWeight:700, fontSize:16, color:'#eab308'}}>
+            <div className="kpi-label" style={{ color: '#94a3b8' }}>In-Prog</div>
+            <div className="kpi-value" style={{ fontWeight: 700, fontSize: 16, color: '#eab308' }}>
               {summary.inprog.toFixed(2)} m
             </div>
           </div>
         </div>
 
-        <div style={{marginBottom:12, color:'#cbd5e1', fontSize:13, lineHeight:1.5}}>
+        <div style={{ marginBottom: 12, color: '#cbd5e1', fontSize: 13, lineHeight: 1.5 }}>
           <div><b>Kullanım</b></div>
           <div>• <b>Sol tek tık</b>: Yakındaki segmente toggle (done ↔ todo).</div>
           <div>• <b>Sol bas & sürükle</b>: İlk temas “todo” ise boya (<b>done</b>), “done” ise sil (<b>todo</b>).</div>
           <div>• <b>Orta tuş</b>: Basılı tut & sürükle = <b>Pan</b>.</div>
           <div>• <b>Sağ tuş</b> (ops.): Silgi.</div>
-          <div style={{marginTop:8}}>
-            <b>Renkler</b>: BG çizgiler <span style={{color:'#94a3b8'}}>slate</span> / Trench:
-            <span style={{color:'#f59e0b'}}> todo</span>,
-            <span style={{color:'#eab308'}}> in-progress</span>,
-            <span style={{color:'#22c55e'}}> done</span>.
+          <div style={{ marginTop: 8 }}>
+            <b>Renkler</b>: BG çizgiler <span style={{ color: '#94a3b8' }}>slate</span> / Trench:
+            <span style={{ color: '#f59e0b' }}> todo</span>,
+            <span style={{ color: '#eab308' }}> in-progress</span>,
+            <span style={{ color: '#22c55e' }}> done</span>.
           </div>
         </div>
       </aside>
