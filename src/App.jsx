@@ -1,14 +1,14 @@
-// src/App.jsx — Dark, polished UI (slate theme) + subtle BG + vivid trench
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { MapContainer, GeoJSON, useMap, useMapEvent, Pane } from 'react-leaflet'
 import 'leaflet/dist/leaflet.css'
-import { bbox as turfBbox, distance as turfDistance, point as turfPoint } from '@turf/turf'
+import { bbox as turfBbox, distance as turfDistance, point as turfPoint, nearestPointOnLine, lineSlice, length as turfLength } from '@turf/turf'
 import RBush from 'rbush'
+import { along as turfAlong } from '@turf/turf'
 
-const LS_KEY = 'trench-mvp-geojson-v3'
-const PIXEL_TOLERANCE = 140 // px — zoom’dan bağımsız yakınlık eşiği
+const LS_KEY = 'trench-mvp-geojson-v4'
+const PIXEL_TOLERANCE = 15
 
-// ====== Geometry helpers (pixel-space distance) ======
+// ====== Geometry helpers ======
 function distPointToSegment(p, a, b) {
   const vx = b.x - a.x, vy = b.y - a.y
   const wx = p.x - a.x, wy = p.y - a.y
@@ -61,6 +61,7 @@ function metersToDegreeBox(centerLat, radiusM, inflate = 2.2) {
   const lonDeg = (radiusM / (111320 * Math.max(Math.cos(centerLat * Math.PI / 180), 0.01))) * inflate
   return { latDeg, lonDeg }
 }
+
 function pickNearestFeature(map, latlng, allFeatures, spatialIndex) {
   let candidates = []
   if (spatialIndex) {
@@ -82,20 +83,15 @@ function pickNearestFeature(map, latlng, allFeatures, spatialIndex) {
   return { feature: best, dpx: bestD }
 }
 
-// ====== GeoJSON normalize ======
-
-// ====== GeoJSON normalize & Grouping ======
 // ====== GeoJSON normalize & Grouping ======
 function normalizeGeoJSON(j) {
   // 1. Filter: Keep only 'trenches' layer
   const rawFeats = (j.features || []).filter(f => f.properties?.layer === 'trenches')
 
-  // 2. Grouping: Identify parallel lines (trench sides)
-  // Threshold: 2.0 meters (0.002 km) to be safe for wider trenches
+  // 2. Grouping
   const THRESHOLD_KM = 0.002
-
-  const assigned = new Set() // set of indices
-  const groups = [] // array of arrays of features
+  const assigned = new Set()
+  const groups = []
 
   for (let i = 0; i < rawFeats.length; i++) {
     if (assigned.has(i)) continue
@@ -103,7 +99,6 @@ function normalizeGeoJSON(j) {
     const group = [f1]
     assigned.add(i)
 
-    // Simple centroid/midpoint for f1
     const c1 = f1.geometry.coordinates
     const p1_start = c1 && c1.length > 0 ? c1[0] : null
     const p1_end = c1 && c1.length > 0 ? c1[c1.length - 1] : null
@@ -117,12 +112,9 @@ function normalizeGeoJSON(j) {
       const p2_end = c2 && c2.length > 0 ? c2[c2.length - 1] : null
       if (!p2_start) continue
 
-      // Check distance between start points (approx)
-      // Check both normal direction (start-start) and reversed (start-end)
       const d_normal = turfDistance(turfPoint(p1_start), turfPoint(p2_start), { units: 'kilometers' })
       const d_reverse = turfDistance(turfPoint(p1_start), turfPoint(p2_end), { units: 'kilometers' })
 
-      // If close in either configuration, assume same trench group
       if (d_normal < THRESHOLD_KM || d_reverse < THRESHOLD_KM) {
         group.push(f2)
         assigned.add(k)
@@ -131,17 +123,19 @@ function normalizeGeoJSON(j) {
     groups.push(group)
   }
 
-  // 3. Flatten and assign lineIds
+  // 3. Flatten and assign lineIds + Progress
   const feats = []
   groups.forEach((grp, gIdx) => {
     const lineId = `G_${gIdx}`
-    // Use the length of the FIRST segment as the logical length for the group
-    const logicalMeters = grp[0].properties?.length_m || grp[0].properties?.meters || 0
+    // Calculate logical length from the first segment
+    const first = grp[0]
+    const len = turfLength(first, { units: 'meters' })
 
     grp.forEach((f, i) => {
       const p = { ...(f.properties || {}) }
       const id = p.id ?? `SEG_${gIdx}_${i}`
-      const status = p.status ?? 'todo'
+      // Initialize progress if not present
+      const progress = (typeof p.progress === 'number') ? p.progress : 0
       const _bbox = turfBbox(f)
 
       feats.push({
@@ -150,8 +144,8 @@ function normalizeGeoJSON(j) {
           ...p,
           id,
           lineId,
-          meters: logicalMeters, // Each segment carries the group's length info
-          status,
+          meters: len, // Store total length
+          progress,    // 0.0 to 1.0
           _bbox
         }
       })
@@ -254,7 +248,6 @@ function KillBrowserDefaults() {
 }
 
 // Hover (proximity)
-// Hover (proximity)
 function MapHoverProximity({ setHoverId, features, spatialIndex }) {
   const map = useMap()
   useMapEvent('mousemove', (e) => {
@@ -266,32 +259,38 @@ function MapHoverProximity({ setHoverId, features, spatialIndex }) {
   return null
 }
 
-// Unified Brush with Interpolation
-function MapBrushUnified({ setStatusById, features, spatialIndex }) {
+// Unified Brush with Progress
+function MapBrushUnified({ setProgressById, features, spatialIndex }) {
   const map = useMap()
   const isDownRef = useRef(false)
   const downButtonRef = useRef(0)
-  const touchedRef = useRef(new Set())
   const lastDragLatLngRef = useRef(null)
 
   const processPoint = (latlng, btn) => {
     const { feature, dpx } = pickNearestFeature(map, latlng, features, spatialIndex)
     if (feature && dpx <= PIXEL_TOLERANCE) {
-      const fid = feature.properties.id
-      if (touchedRef.current.has(fid)) return
+      // Calculate progress along the line
+      const pt = turfPoint([latlng.lng, latlng.lat])
+      const snapped = nearestPointOnLine(feature, pt)
+
+      const start = turfPoint(feature.geometry.coordinates[0])
+      const slice = lineSlice(start, snapped, feature)
+      const dist = turfLength(slice, { units: 'meters' })
+      const total = feature.properties.meters || 1
+
+      let newProg = dist / total
+      if (newProg > 1) newProg = 1
+      if (newProg < 0) newProg = 0
 
       if (btn === 0) {
-        // LMB → paint (done)
-        if ((feature.properties.status || 'todo') !== 'done') {
-          setStatusById(fid, 'done')
+        // LMB -> Paint (max)
+        const current = feature.properties.progress || 0
+        if (newProg > current) {
+          setProgressById(feature.properties.id, newProg)
         }
-        touchedRef.current.add(fid)
       } else if (btn === 2) {
-        // RMB → erase (todo)
-        if ((feature.properties.status || 'todo') !== 'todo') {
-          setStatusById(fid, 'todo')
-        }
-        touchedRef.current.add(fid)
+        // RMB -> Erase
+        setProgressById(feature.properties.id, newProg)
       }
     }
   }
@@ -302,68 +301,95 @@ function MapBrushUnified({ setStatusById, features, spatialIndex }) {
     downButtonRef.current = ev.button ?? 0
     lastDragLatLngRef.current = e.latlng
 
-    if (downButtonRef.current === 1) return // middle: pan
+    if (downButtonRef.current === 1) return
 
     isDownRef.current = true
-    touchedRef.current = new Set()
-
-    // Process initial click point
     processPoint(e.latlng, downButtonRef.current)
-
     ev.preventDefault(); ev.stopPropagation()
   })
 
   useMapEvent('mousemove', (e) => {
     if (!isDownRef.current) return
     const btn = downButtonRef.current
-    if (btn === 1) return // middle: pan
+    if (btn === 1) return
 
     const currentLatLng = e.latlng
     const lastLatLng = lastDragLatLngRef.current || currentLatLng
 
-    // Interpolation logic
+    // Interpolation
     const p1 = map.latLngToContainerPoint(lastLatLng)
     const p2 = map.latLngToContainerPoint(currentLatLng)
     const dist = p1.distanceTo(p2)
-    const stepSize = 5 // pixels
+    const stepSize = 5
     const steps = Math.ceil(dist / stepSize)
 
     for (let i = 1; i <= steps; i++) {
       const t = i / steps
-      // Linear interpolation of container points
       const x = p1.x + (p2.x - p1.x) * t
       const y = p1.y + (p2.y - p1.y) * t
       const latlng = map.containerPointToLatLng([x, y])
       processPoint(latlng, btn)
     }
-
     lastDragLatLngRef.current = currentLatLng
   })
 
   useMapEvent('mouseup', () => {
     isDownRef.current = false
     downButtonRef.current = 0
-    touchedRef.current.clear()
     lastDragLatLngRef.current = null
   })
 
   return null
 }
 
-// ====== STYLES (palette) ======
+// ====== STYLES ======
 const bgStyleFn = () => ({
-  color: '#94a3b8',      // slate-400
-  weight: 1.15,
-  opacity: 0.65,
-  lineCap: 'butt',
-  lineJoin: 'miter',
-  className: 'bg-line'
+  color: '#94a3b8', weight: 1.15, opacity: 0.65, className: 'bg-line'
 })
 
-const trenchColor = (status) => {
-  if (status === 'done') return '#22c55e'       // emerald-500
-  if (status === 'in_progress') return '#eab308'// yellow-500
-  return '#f59e0b'                              // amber-500
+// Helper component for Done Layer to handle slicing
+function DoneLayer({ data }) {
+  const doneGeoJSON = useMemo(() => {
+    if (!data) return null
+    const slices = []
+    for (const f of data.features) {
+      const p = f.properties.progress || 0
+      if (p <= 0.01) continue
+
+      if (p >= 0.99) {
+        slices.push(f)
+        continue
+      }
+
+      try {
+        const len = f.properties.meters
+        const dist = len * p
+        const start = turfPoint(f.geometry.coordinates[0])
+        const endPt = turfAlong(f, dist / 1000, { units: 'kilometers' })
+
+        const slice = lineSlice(start, endPt, f)
+        slices.push(slice)
+      } catch (e) { }
+    }
+    return { type: 'FeatureCollection', features: slices }
+  }, [data])
+
+  if (!doneGeoJSON) return null
+
+  return (
+    <Pane name="done" style={{ zIndex: 401 }}>
+      <GeoJSON
+        data={doneGeoJSON}
+        style={{
+          color: '#22c55e', // green
+          weight: 6,
+          opacity: 1,
+          lineCap: 'round'
+        }}
+        interactive={false}
+      />
+    </Pane>
+  )
 }
 
 // ====== APP ======
@@ -415,69 +441,36 @@ export default function App() {
     return tree
   }, [data])
 
-  // summary
+  // Summary
   const summary = useMemo(() => {
-    let total = 0, done = 0, inprog = 0, todo = 0
-
-    // Iterate by unique lineId to avoid double counting
+    let total = 0, done = 0
     const seenLines = new Set()
 
     for (const f of (data?.features || [])) {
       const lid = f.properties.lineId
-      if (seenLines.has(lid)) continue // already counted this trench
+      if (seenLines.has(lid)) continue
       seenLines.add(lid)
 
       const m = Number(f.properties?.meters ?? 0)
-      total += m
+      const p = Number(f.properties?.progress ?? 0)
 
-      // Status is shared across the group, so checking this feature is enough
-      const s = f.properties?.status || 'todo'
-      if (s === 'done') done += m
-      else if (s === 'in_progress') inprog += m
-      else todo += m
+      total += m
+      done += m * p
     }
-    return { total, done, inprog, todo, remaining: total - done }
+    return { total, done, remaining: total - done }
   }, [data])
 
-  // trench style: polished weights + glow
-  const styleFn = (feature) => {
-    const status = feature.properties?.status ?? 'todo'
-    const isHover = hoverId && feature.properties?.id === hoverId
-    const baseColor = trenchColor(status)
-    const w =
-      status === 'done' ? (isHover ? 10 : 8) :
-        status === 'in_progress' ? (isHover ? 7 : 5.5) :
-          (isHover ? 6 : 4.5)
-
-    const cls =
-      'seg ' +
-      (status === 'done'
-        ? 'seg-done'
-        : status === 'in_progress'
-          ? 'seg-inprog'
-          : 'seg-todo') +
-      (isHover ? ' seg-hover' : '')
-
-    return {
-      color: baseColor,
-      weight: w,
-      opacity: 1,
-      lineCap: 'round',
-      className: cls
-    }
-  }
-
-  const setStatusById = (id, next) => setData(prev => {
+  // Set Progress
+  const setProgressById = (id, newProg) => setData(prev => {
     if (!prev) return prev
-    // Find the lineId of the clicked segment
     const clicked = prev.features.find(f => f.properties.id === id)
     if (!clicked) return prev
     const targetLineId = clicked.properties.lineId
 
-    // Update ALL segments with that lineId
+    // Update ALL segments in group
     const feats = prev.features.map(f =>
       f.properties.lineId === targetLineId
-        ? { ...f, properties: { ...f.properties, status: next } }
+        ? { ...f, properties: { ...f.properties, progress: newProg } }
         : f
     )
     return { ...prev, features: feats }
@@ -485,172 +478,75 @@ export default function App() {
 
   const clearAll = () => setData(prev => {
     if (!prev) return prev
-    return { ...prev, features: prev.features.map(f => ({ ...f, properties: { ...f.properties, status: 'todo' } })) }
+    return { ...prev, features: prev.features.map(f => ({ ...f, properties: { ...f.properties, progress: 0 } })) }
   })
 
   return (
     <div style={{
-      height: '100vh',
-      width: '100vw',
-      display: 'grid',
-      gridTemplateColumns: '1fr 360px',
-      background: '#0b1220', // deep slate/navy
-      color: '#e5e7eb'
+      height: '100vh', width: '100vw', display: 'grid', gridTemplateColumns: '1fr 360px',
+      background: '#0b1220', color: '#e5e7eb'
     }}>
       <div>
-        <MapContainer
-          center={[52.6, -1.7]}
-          zoom={17}
-          minZoom={5}
-          maxZoom={22}
-          dragging={false}
-          wheelPxPerZoomLevel={60}
-          scrollWheelZoom={true}
-          doubleClickZoom={false}
-          preferCanvas={false}
-          style={{
-            height: '100%',
-            width: '100%',
-            background: '#0f172a', // slate-900
-            outline: '1px solid #0b1220'
-          }}
-        >
+        <MapContainer center={[52.6, -1.7]} zoom={17} style={{ height: '100%', width: '100%', background: '#0f172a' }}>
           <KillBrowserDefaults />
           <MiddleMousePan />
 
-          {/* Hover/Brush yalnızca trenches üzerinde */}
+          {/* 1. Background Layer (Todo) - The full lines in yellow/amber */}
+          {data && (
+            <Pane name="todo" style={{ zIndex: 400 }}>
+              <GeoJSON
+                data={data}
+                style={(f) => {
+                  const isHover = hoverId && f.properties.id === hoverId
+                  return {
+                    color: '#f59e0b', // amber
+                    weight: isHover ? 6 : 4.5,
+                    opacity: 1, lineCap: 'round'
+                  }
+                }}
+                interactive={false}
+              />
+            </Pane>
+          )}
+
+          {/* 2. Overlay Layer (Done) - The sliced green lines */}
+          <DoneLayer data={data} />
+
+          {/* Logic */}
           {data?.features && (
             <>
-              <MapHoverProximity
-                setHoverId={setHoverId}
-                features={data.features}
-                spatialIndex={spatialIndex}
-              />
-              <MapBrushUnified
-                setStatusById={setStatusById}
-                features={data.features}
-                spatialIndex={spatialIndex}
-              />
+              <MapHoverProximity setHoverId={setHoverId} features={data.features} spatialIndex={spatialIndex} />
+              <MapBrushUnified setProgressById={setProgressById} features={data.features} spatialIndex={spatialIndex} />
             </>
           )}
 
-          {/* Background: subtle slate lines */}
-          {bgData && (
-            <Pane name="bg" style={{ zIndex: 200 }}>
-              <GeoJSON
-                data={bgData}
-                style={bgStyleFn}
-                interactive={false}
-                bubblingMouseEvents={false}
-                smoothFactor={1}
-              />
-            </Pane>
-          )}
-
-          {/* Trench: vivid, status-based */}
-          {data && (
-            <Pane name="fg" style={{ zIndex: 400 }}>
-              <GeoJSON
-                key={dataVersion}
-                data={data}
-                style={styleFn}
-                interactive={false}
-                bubblingMouseEvents={true}
-              />
-              <FitToDataOnce geojson={data} />
-            </Pane>
-          )}
+          <FitToDataOnce geojson={data} />
         </MapContainer>
       </div>
-
-      <aside style={{
-        padding: '14px 16px',
-        borderLeft: '1px solid #1e293b',    // slate-800
-        background: 'linear-gradient(180deg, #0b1220 0%, #0d1628 100%)',
-        boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.02)'
-      }}>
+      {/* Sidebar */}
+      <aside style={{ padding: '14px 16px', background: '#0b1220', borderLeft: '1px solid #1e293b' }}>
         <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginBottom: 12 }}>
           <b style={{ fontSize: 16, letterSpacing: .2 }}>Trench-MVP</b>
-          <span style={{
-            marginLeft: 'auto',
-            fontSize: 11,
-            opacity: .7,
-            background: '#0f172a',
-            border: '1px solid #1f2937',
-            padding: '4px 8px',
-            borderRadius: 999
-          }}>Dark</span>
-          <button
-            onClick={clearAll}
-            style={{
-              background: '#0f172a',
-              color: '#e5e7eb',
-              border: '1px solid #334155',
-              borderRadius: 10,
-              padding: '6px 12px',
-              cursor: 'pointer',
-              transition: 'all .15s ease',
-              boxShadow: '0 0 0 0 rgba(0,0,0,0)'
-            }}
-            onMouseOver={e => { e.currentTarget.style.borderColor = '#475569' }}
-            onMouseOut={e => { e.currentTarget.style.borderColor = '#334155' }}
-          >
-            Clear
-          </button>
+          <span style={{ marginLeft: 'auto', fontSize: 11, opacity: .7, background: '#0f172a', border: '1px solid #1f2937', padding: '4px 8px', borderRadius: 999 }}>Dark</span>
+          <button onClick={clearAll} style={{ background: '#0f172a', color: '#e5e7eb', border: '1px solid #334155', borderRadius: 10, padding: '6px 12px', cursor: 'pointer' }}>Clear</button>
+        </div>
+        <div className="kpi-box" style={{ marginBottom: 10 }}>
+          <div className="kpi-label">Toplam</div>
+          <div className="kpi-value">{summary.total.toFixed(2)} m</div>
+        </div>
+        <div className="kpi-box" style={{ marginBottom: 10 }}>
+          <div className="kpi-label">Tamamlanan</div>
+          <div className="kpi-value" style={{ color: '#22c55e' }}>{summary.done.toFixed(2)} m</div>
+        </div>
+        <div className="kpi-box">
+          <div className="kpi-label">Kalan</div>
+          <div className="kpi-value">{summary.remaining.toFixed(2)} m</div>
         </div>
 
-        <div style={{
-          display: 'grid',
-          gridTemplateColumns: '1fr 1fr',
-          gap: 10,
-          marginBottom: 14
-        }}>
-          <div className="kpi-box" style={{
-            borderColor: '#1f2937', background: '#0f172a', borderRadius: 12, padding: 10
-          }}>
-            <div className="kpi-label" style={{ color: '#94a3b8' }}>Toplam</div>
-            <div className="kpi-value" style={{ fontWeight: 700, fontSize: 16 }}>
-              {summary.total.toFixed(2)} m
-            </div>
-          </div>
-          <div className="kpi-box" style={{
-            borderColor: '#1f2937', background: '#0f172a', borderRadius: 12, padding: 10
-          }}>
-            <div className="kpi-label" style={{ color: '#94a3b8' }}>Kalan</div>
-            <div className="kpi-value" style={{ fontWeight: 700, fontSize: 16 }}>
-              {summary.remaining.toFixed(2)} m
-            </div>
-          </div>
-          <div className="kpi-box" style={{
-            borderColor: '#1f2937', background: '#0f172a', borderRadius: 12, padding: 10
-          }}>
-            <div className="kpi-label" style={{ color: '#94a3b8' }}>Done</div>
-            <div className="kpi-value" style={{ fontWeight: 700, fontSize: 16, color: '#22c55e' }}>
-              {summary.done.toFixed(2)} m
-            </div>
-          </div>
-          <div className="kpi-box" style={{
-            borderColor: '#1f2937', background: '#0f172a', borderRadius: 12, padding: 10
-          }}>
-            <div className="kpi-label" style={{ color: '#94a3b8' }}>In-Prog</div>
-            <div className="kpi-value" style={{ fontWeight: 700, fontSize: 16, color: '#eab308' }}>
-              {summary.inprog.toFixed(2)} m
-            </div>
-          </div>
-        </div>
-
-        <div style={{ marginBottom: 12, color: '#cbd5e1', fontSize: 13, lineHeight: 1.5 }}>
-          <div><b>Kullanım</b></div>
-          <div>• <b>Sol tek tık</b>: Yakındaki segmente toggle (done ↔ todo).</div>
-          <div>• <b>Sol bas & sürükle</b>: İlk temas “todo” ise boya (<b>done</b>), “done” ise sil (<b>todo</b>).</div>
-          <div>• <b>Orta tuş</b>: Basılı tut & sürükle = <b>Pan</b>.</div>
-          <div>• <b>Sağ tuş</b> (ops.): Silgi.</div>
-          <div style={{ marginTop: 8 }}>
-            <b>Renkler</b>: BG çizgiler <span style={{ color: '#94a3b8' }}>slate</span> / Trench:
-            <span style={{ color: '#f59e0b' }}> todo</span>,
-            <span style={{ color: '#eab308' }}> in-progress</span>,
-            <span style={{ color: '#22c55e' }}> done</span>.
-          </div>
+        <div style={{ marginTop: 20, fontSize: 12, color: '#64748b' }}>
+          <p>Sol Basılı Tut: Boya (İlerleme)</p>
+          <p>Sağ Basılı Tut: Sil</p>
+          <p>Orta Tuş: Kaydır</p>
         </div>
       </aside>
     </div>
