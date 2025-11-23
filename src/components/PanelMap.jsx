@@ -225,7 +225,7 @@ function MapBrushUnified({ setProgressForLine, features, spatialIndex, beginUndo
       if (pointProg > 1) pointProg = 1
       if (pointProg < 0) pointProg = 0
 
-      const brushMeters = 2
+      const brushMeters = 0.5
       const brushProg = brushMeters / total
       const startP = Math.max(0, pointProg - brushProg / 2)
       const endP = Math.min(1, pointProg + brushProg / 2)
@@ -365,10 +365,10 @@ function DoneLayer({ features, version }) {
         ref={ref1}
         data={null}
         style={{
-          color: '#064e3b',
-          weight: 5,
-          opacity: 0.85,
-          lineCap: 'butt'
+          color: '#059669',
+          weight: 12,
+          opacity: 0.4,
+          lineCap: 'round'
         }}
         interactive={false}
       />
@@ -376,11 +376,10 @@ function DoneLayer({ features, version }) {
         ref={ref2}
         data={null}
         style={{
-          color: '#34d399',
-          weight: 3.2,
+          color: '#10b981',
+          weight: 6,
           opacity: 1,
-          dashArray: '6 8',
-          lineCap: 'butt'
+          lineCap: 'round'
         }}
         interactive={false}
       />

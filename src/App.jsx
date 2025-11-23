@@ -12,7 +12,7 @@ const MAX_UNDO = 50
 const cloneData = (state) => JSON.parse(JSON.stringify(state))
 
 function normalizeGeoJSON(j) {
-  const rawFeats = (j.features || []).filter(f => f.properties?.layer === 'trenches')
+  const rawFeats = (j.features || [])
   const THRESHOLD_KM = 0.002
   const assigned = new Set()
   const groups = []
