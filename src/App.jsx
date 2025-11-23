@@ -5,7 +5,7 @@ import 'leaflet/dist/leaflet.css'
 import { bbox as turfBbox } from '@turf/turf'
 import RBush from 'rbush'
 
-const LS_KEY = 'trench-mvp-geojson-v2'
+const LS_KEY = 'trench-mvp-geojson-v3'
 const PIXEL_TOLERANCE = 140 // px — zoom’dan bağımsız yakınlık eşiği
 
 // ====== Geometry helpers (pixel-space distance) ======
@@ -88,9 +88,10 @@ function normalizeGeoJSON(j){
     const p={...(f.properties||{})}
     const id=p.id ?? `SEG_${i}`
     const lineId=p.lineId ?? 'L0'
-    const meters = typeof p.meters==='number' ? p.meters
-                 : typeof p.meter==='number' ? p.meter
-                 : undefined
+    const meters =
+      (typeof p.meters === 'number' && !isNaN(p.meters)) ? p.meters :
+      (typeof p.length_m === 'number' && !isNaN(p.length_m)) ? p.length_m :
+      0
     const status=p.status ?? 'todo'
     let start=null,end=null
     if(f.geometry?.type==='LineString' && f.geometry.coordinates?.length>=2){
@@ -371,7 +372,7 @@ export default function App(){
   const summary = useMemo(()=>{
     let total=0, done=0, inprog=0, todo=0
     for(const f of (data?.features||[])){
-      const m=Number(f.properties?.meters)||0
+      const m = Number(f.properties?.meters ?? 0)
       total+=m
       const s=f.properties?.status||'todo'
       if(s==='done') done+=m
