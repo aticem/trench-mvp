@@ -40,3 +40,17 @@
 .read-the-docs {
   color: #888;
 }
+
+.bg-text-label {
+  color: #e2e8f0;
+  font-size: 11px;
+  font-weight: 600;
+  text-shadow: 0 0 3px rgba(15, 23, 42, 0.95);
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.bg-text-label__inner {
+  display: inline-block;
+  transform-origin: 0 50%;
+}

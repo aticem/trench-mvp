@@ -5,8 +5,9 @@ import PanelMap from './components/PanelMap.jsx'
 import ProgressStats from './components/ProgressStats.jsx'
 import useDailyLog from './components/useDailyLog.js'
 import { useChartExport } from './components/useChartExport.js'
+import './App.css'
 
-const LS_KEY = 'trench-mvp-geojson-v4'
+const LS_KEY = 'trench-mvp-geojson-v5';
 const MAX_UNDO = 50
 
 const cloneData = (state) => JSON.parse(JSON.stringify(state))
@@ -25,7 +26,8 @@ function normalizeGeoJSON(j) {
 
     const c1 = f1.geometry.coordinates
     const p1_start = c1 && c1.length > 0 ? c1[0] : null
-    if (!p1_start) continue
+    const p1_end = c1 && c1.length > 0 ? c1[c1.length - 1] : null
+    if (!p1_start || !p1_end) continue
 
     for (let k = i + 1; k < rawFeats.length; k++) {
       if (assigned.has(k)) continue
@@ -33,12 +35,14 @@ function normalizeGeoJSON(j) {
       const c2 = f2.geometry.coordinates
       const p2_start = c2 && c2.length > 0 ? c2[0] : null
       const p2_end = c2 && c2.length > 0 ? c2[c2.length - 1] : null
-      if (!p2_start) continue
+      if (!p2_start || !p2_end) continue
 
-      const d_normal = turfDistance(turfPoint(p1_start), turfPoint(p2_start), { units: 'kilometers' })
-      const d_reverse = turfDistance(turfPoint(p1_start), turfPoint(p2_end || p2_start), { units: 'kilometers' })
+      const d_s_s = turfDistance(turfPoint(p1_start), turfPoint(p2_start), { units: 'kilometers' })
+      const d_e_e = turfDistance(turfPoint(p1_end), turfPoint(p2_end), { units: 'kilometers' })
+      const d_s_e = turfDistance(turfPoint(p1_start), turfPoint(p2_end), { units: 'kilometers' })
+      const d_e_s = turfDistance(turfPoint(p1_end), turfPoint(p2_start), { units: 'kilometers' })
 
-      if (d_normal < THRESHOLD_KM || d_reverse < THRESHOLD_KM) {
+      if ((d_s_s < THRESHOLD_KM && d_e_e < THRESHOLD_KM) || (d_s_e < THRESHOLD_KM && d_e_s < THRESHOLD_KM)) {
         group.push(f2)
         assigned.add(k)
       }
@@ -49,12 +53,11 @@ function normalizeGeoJSON(j) {
   const feats = []
   groups.forEach((grp, gIdx) => {
     const lineId = `G_${gIdx}`
-    const first = grp[0]
-    const len = turfLength(first, { units: 'meters' })
 
     grp.forEach((f, i) => {
       const p = { ...(f.properties || {}) }
       const id = p.id ?? `SEG_${gIdx}_${i}`
+      const len = turfLength(f, { units: 'meters' })
       let ranges = p.ranges || []
       if (typeof p.progress === 'number' && p.progress > 0) {
         ranges = [[0, p.progress]]
@@ -84,6 +87,7 @@ function normalizeGeoJSON(j) {
 export default function App() {
   const [features, setFeatures] = useState([])
   const [bgData, setBgData] = useState(null)
+  const [textData, setTextData] = useState(null)
   const [dataVersion, setDataVersion] = useState(0)
   const [isSubmitOpen, setSubmitOpen] = useState(false)
   const [undoStack, setUndoStack] = useState([])
@@ -142,8 +146,19 @@ export default function App() {
 
     fetch('/background.geojson')
       .then(r => r.json())
-      .then(j => setBgData(j))
-      .catch(console.error)
+      .then(j => {
+        console.log('Background loaded:', j.features?.length)
+        setBgData(j)
+      })
+      .catch(err => console.error('Failed to load background:', err))
+
+    fetch('/text.geojson')
+      .then(r => r.json())
+      .then(j => {
+        console.log('Text layer loaded:', j.features?.length)
+        setTextData(j)
+      })
+      .catch(err => console.error('Failed to load text layer:', err))
   }, [])
 
   useEffect(() => {
@@ -278,6 +293,7 @@ export default function App() {
             features={features}
             setFeatures={setFeatures}
             bgData={bgData}
+            textData={textData}
             beginUndoableAction={beginUndoableAction}
             dataVersion={dataVersion}
           />

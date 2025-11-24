@@ -1,12 +1,38 @@
-import React, { useMemo, useRef, useCallback } from 'react'
+import React, { useMemo, useRef, useCallback, useState } from 'react'
 import { MapContainer, GeoJSON, useMap, useMapEvent, Pane } from 'react-leaflet'
 import 'leaflet/dist/leaflet.css'
-import { bbox as turfBbox, point as turfPoint, nearestPointOnLine, lineSlice, length as turfLength } from '@turf/turf'
+import { bbox as turfBbox, point as turfPoint, nearestPointOnLine, lineSlice, length as turfLength, bboxClip } from '@turf/turf'
 import RBush from 'rbush'
 import { along as turfAlong } from '@turf/turf'
 import L from 'leaflet'
 
 const PIXEL_TOLERANCE = 15
+const BG_TEXT_CLASS = 'bg-text-label'
+
+function escapeHtml(str = '') {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+function makeTextMarker(feature, latlng) {
+  const text = feature?.properties?.text
+  if (!text) {
+    return L.circleMarker(latlng, { radius: 0, opacity: 0, interactive: false })
+  }
+  const angle = Number(feature?.properties?.angle || 0)
+  const html = `<span class="${BG_TEXT_CLASS}__inner" style="transform: rotate(${angle}deg);">${escapeHtml(text)}</span>`
+  return L.marker(latlng, {
+    icon: L.divIcon({
+      className: BG_TEXT_CLASS,
+      html,
+      iconSize: [0, 0]
+    }),
+    interactive: false
+  })
+}
 
 function distPointToSegment(p, a, b) {
   const vx = b.x - a.x, vy = b.y - a.y
@@ -186,12 +212,12 @@ function MapHoverProximity({ setHoverId, features, spatialIndex }) {
   return null
 }
 
-function MapBrushUnified({ setProgressForLine, features, spatialIndex, beginUndoableAction }) {
+function MapBoxSelection({ setFeatures, features, spatialIndex, beginUndoableAction }) {
   const map = useMap()
-  const isDownRef = useRef(false)
-  const downButtonRef = useRef(0)
-  const lastDragLatLngRef = useRef(null)
-  const actionStartedRef = useRef(false)
+  const [selectionBox, setSelectionBox] = React.useState(null)
+  const startRef = useRef(null)
+  const draggingRef = useRef(false)
+  const buttonRef = useRef(0)
 
   const mergeRanges = (ranges) => {
     if (!ranges || ranges.length === 0) return []
@@ -211,116 +237,178 @@ function MapBrushUnified({ setProgressForLine, features, spatialIndex, beginUndo
     return merged
   }
 
-  const processPoint = (latlng, btn) => {
-    const { feature, dpx } = pickNearestFeature(map, latlng, features, spatialIndex)
-    if (feature && dpx <= PIXEL_TOLERANCE) {
-      const pt = turfPoint([latlng.lng, latlng.lat])
-      const snapped = nearestPointOnLine(feature, pt)
-      const start = turfPoint(feature.geometry.coordinates[0])
-      const slice = lineSlice(start, snapped, feature)
-      const dist = turfLength(slice, { units: 'meters' })
-      const total = feature.properties.meters || 1
-
-      let pointProg = dist / total
-      if (pointProg > 1) pointProg = 1
-      if (pointProg < 0) pointProg = 0
-
-      const brushMeters = 0.5
-      const brushProg = brushMeters / total
-      const startP = Math.max(0, pointProg - brushProg / 2)
-      const endP = Math.min(1, pointProg + brushProg / 2)
-
-      if (btn === 0) {
-        const currentRanges = feature.properties.ranges || []
-        const combined = [...currentRanges, [startP, endP]]
-        setProgressForLine(feature.properties.lineId, mergeRanges(combined))
-      } else if (btn === 2) {
-        const currentRanges = feature.properties.ranges || []
-        const newRanges = []
-        for (const r of currentRanges) {
-          if (r[1] < startP || r[0] > endP) {
-            newRanges.push(r)
-            continue
-          }
-          if (r[0] < startP) newRanges.push([r[0], startP])
-          if (r[1] > endP) newRanges.push([endP, r[1]])
-        }
-        setProgressForLine(feature.properties.lineId, newRanges)
-      }
-    }
-  }
-
-  useMapEvent('mousedown', (e) => {
-    const ev = e.originalEvent
-    if (!ev) return
-    const btn = ev.button ?? 0
-    const { feature, dpx } = pickNearestFeature(map, e.latlng, features, spatialIndex)
-    if (btn === 0 && feature && dpx <= PIXEL_TOLERANCE) {
-      isDownRef.current = true
-      downButtonRef.current = 0
-      lastDragLatLngRef.current = e.latlng
+  React.useEffect(() => {
+    const container = map.getContainer()
+    
+    const onMouseDown = (e) => {
+      if (e.button !== 0 && e.button !== 2) return
+      e.preventDefault()
+      e.stopPropagation()
+      
+      draggingRef.current = true
+      buttonRef.current = e.button
+      const rect = container.getBoundingClientRect()
+      const x = e.clientX - rect.left
+      const y = e.clientY - rect.top
+      startRef.current = { x, y }
+      setSelectionBox({ x, y, w: 0, h: 0, type: e.button === 0 ? 'select' : 'unselect' })
       map.dragging.disable()
-      if (!actionStartedRef.current) {
-        beginUndoableAction?.()
-        actionStartedRef.current = true
-      }
-      processPoint(e.latlng, 0)
-      L.DomEvent.stop(ev)
-      return
     }
-    if (btn === 2 && feature && dpx <= PIXEL_TOLERANCE) {
-      isDownRef.current = true
-      downButtonRef.current = 2
-      lastDragLatLngRef.current = e.latlng
-      map.dragging.disable()
-      if (!actionStartedRef.current) {
-        beginUndoableAction?.()
-        actionStartedRef.current = true
-      }
-      processPoint(e.latlng, 2)
-      L.DomEvent.stop(ev)
-    }
-  })
 
-  useMapEvent('mousemove', (e) => {
-    if (!isDownRef.current) return
-    const btn = downButtonRef.current
-    const currentLatLng = e.latlng
-    const lastLatLng = lastDragLatLngRef.current || currentLatLng
-    const p1 = map.latLngToContainerPoint(lastLatLng)
-    const p2 = map.latLngToContainerPoint(currentLatLng)
-    const dist = p1.distanceTo(p2)
-    const stepSize = 5
-    const steps = Math.ceil(dist / stepSize)
-    for (let i = 1; i <= steps; i++) {
-      const t = i / steps
-      const x = p1.x + (p2.x - p1.x) * t
-      const y = p1.y + (p2.y - p1.y) * t
-      const latlng = map.containerPointToLatLng([x, y])
-      processPoint(latlng, btn)
+    const onMouseMove = (e) => {
+      if (!draggingRef.current) return
+      e.preventDefault()
+      e.stopPropagation()
+      
+      const rect = container.getBoundingClientRect()
+      const currentX = e.clientX - rect.left
+      const currentY = e.clientY - rect.top
+      const startX = startRef.current.x
+      const startY = startRef.current.y
+      
+      const x = Math.min(startX, currentX)
+      const y = Math.min(startY, currentY)
+      const w = Math.abs(startX - currentX)
+      const h = Math.abs(startY - currentY)
+      
+      setSelectionBox(prev => ({ ...prev, x, y, w, h }))
     }
-    lastDragLatLngRef.current = currentLatLng
-  })
 
-  useMapEvent('mouseup', () => {
-    if (isDownRef.current) {
-      isDownRef.current = false
-      downButtonRef.current = 0
-      lastDragLatLngRef.current = null
+    const onMouseUp = (e) => {
+      if (!draggingRef.current) return
+      draggingRef.current = false
       map.dragging.enable()
-      actionStartedRef.current = false
-    }
-  })
+      
+      if (selectionBox && selectionBox.w > 2 && selectionBox.h > 2) {
+         beginUndoableAction()
+         
+         const p1 = map.containerPointToLatLng([selectionBox.x, selectionBox.y])
+         const p2 = map.containerPointToLatLng([selectionBox.x + selectionBox.w, selectionBox.y + selectionBox.h])
+         
+         const minX = Math.min(p1.lng, p2.lng)
+         const maxX = Math.max(p1.lng, p2.lng)
+         const minY = Math.min(p1.lat, p2.lat)
+         const maxY = Math.max(p1.lat, p2.lat)
+         
+         const hits = spatialIndex.search({ minX, minY, maxX, maxY })
+         const hitIds = new Set(hits.map(h => h.feature.properties.id))
+         
+         const isSelect = buttonRef.current === 0
+         const bbox = [minX, minY, maxX, maxY]
 
-  return null
+         setFeatures(prev => prev.map(f => {
+           if (hitIds.has(f.properties.id)) {
+             const clipped = bboxClip(f, bbox)
+             if (!clipped || !clipped.geometry || clipped.geometry.coordinates.length === 0) return f
+
+             const totalLen = f.properties.meters || 1
+             const startOfLine = turfPoint(f.geometry.coordinates[0])
+             const newRangesToAddOrRemove = []
+
+             const processSegment = (coords) => {
+               if (coords.length < 2) return
+               const pStart = turfPoint(coords[0])
+               const pEnd = turfPoint(coords[coords.length - 1])
+               
+               const sliceStart = lineSlice(startOfLine, pStart, f)
+               const sliceEnd = lineSlice(startOfLine, pEnd, f)
+               
+               const dStart = turfLength(sliceStart, { units: 'meters' })
+               const dEnd = turfLength(sliceEnd, { units: 'meters' })
+               
+               let r0 = dStart / totalLen
+               let r1 = dEnd / totalLen
+               if (r0 > r1) [r0, r1] = [r1, r0]
+               
+               newRangesToAddOrRemove.push([Math.max(0, r0), Math.min(1, r1)])
+             }
+
+             if (clipped.geometry.type === 'LineString') {
+               processSegment(clipped.geometry.coordinates)
+             } else if (clipped.geometry.type === 'MultiLineString') {
+               clipped.geometry.coordinates.forEach(processSegment)
+             }
+
+             if (newRangesToAddOrRemove.length === 0) return f
+
+             let currentRanges = f.properties.ranges || []
+             let finalRanges = []
+
+             if (isSelect) {
+               const combined = [...currentRanges, ...newRangesToAddOrRemove]
+               finalRanges = mergeRanges(combined)
+             } else {
+               let result = currentRanges
+               for (const [r0, r1] of newRangesToAddOrRemove) {
+                 const nextResult = []
+                 for (const [c0, c1] of result) {
+                   if (c1 < r0 || c0 > r1) {
+                     nextResult.push([c0, c1])
+                   } else {
+                     if (c0 < r0) nextResult.push([c0, r0])
+                     if (c1 > r1) nextResult.push([r1, c1])
+                   }
+                 }
+                 result = nextResult
+               }
+               finalRanges = result
+             }
+
+             let coverage = finalRanges.reduce((sum, [a, b]) => sum + (b - a), 0)
+             let status = 'pending'
+             if (coverage >= 0.99) status = 'done'
+             else if (coverage > 0) status = 'in_progress'
+
+             return { ...f, properties: { ...f.properties, ranges: finalRanges, status } }
+           }
+           return f
+         }))
+      }
+      
+      setSelectionBox(null)
+    }
+
+    container.addEventListener('mousedown', onMouseDown)
+    window.addEventListener('mousemove', onMouseMove)
+    window.addEventListener('mouseup', onMouseUp)
+    
+    return () => {
+      container.removeEventListener('mousedown', onMouseDown)
+      window.removeEventListener('mousemove', onMouseMove)
+      window.removeEventListener('mouseup', onMouseUp)
+    }
+  }, [map, spatialIndex, selectionBox, setFeatures, beginUndoableAction])
+
+  if (!selectionBox) return null
+
+  return (
+    <div style={{
+      position: 'absolute',
+      left: selectionBox.x,
+      top: selectionBox.y,
+      width: selectionBox.w,
+      height: selectionBox.h,
+      border: `2px solid ${selectionBox.type === 'select' ? '#34d399' : '#f87171'}`,
+      backgroundColor: selectionBox.type === 'select' ? 'rgba(52, 211, 153, 0.2)' : 'rgba(248, 113, 113, 0.2)',
+      zIndex: 1000,
+      pointerEvents: 'none'
+    }} />
+  )
 }
 
 const bgStyleFn = () => ({
-  color: '#4c566a',
-  weight: 0.9,
-  opacity: 0.35,
+  color: '#94a3b8', // Lighter slate (Slate 400) for better visibility on dark bg
+  weight: 1,
+  opacity: 0.3,
   lineCap: 'butt',
-  className: 'bg-line'
+  className: 'bg-line',
+  interactive: false
+})
+
+const textStyleFn = () => ({
+  color: '#94a3b8',
+  weight: 0.5,
+  opacity: 0.3
 })
 
 function DoneLayer({ features, version }) {
@@ -387,8 +475,127 @@ function DoneLayer({ features, version }) {
   )
 }
 
-export default function PanelMap({ features, setFeatures, bgData, beginUndoableAction, dataVersion }) {
+function ZoomHandler({ setZoom }) {
+  const map = useMap()
+  useMapEvent('zoomend', () => {
+    setZoom(map.getZoom())
+  })
+  return null
+}
+
+const SvgTextLayer = React.memo(({ data }) => {
+  const map = useMap()
+
+  React.useEffect(() => {
+    if (!data || !map) return
+
+    const TextLayer = L.Layer.extend({
+      onAdd: function(map) {
+        this._map = map
+        // Use the default SVG renderer or create one
+        this._renderer = map.getRenderer(this)
+        
+        // Ensure we are using SVG renderer
+        if (!(this._renderer instanceof L.SVG)) {
+            // Fallback or force SVG? 
+            // Usually default is SVG.
+            // If Canvas is default, we might need to force SVG for this layer?
+            // But we can just create our own SVG container if needed.
+            // Let's assume default is SVG or we can access the overlay pane.
+        }
+
+        this._container = this._renderer._container
+        this._rootGroup = this._renderer._rootGroup
+
+        this._group = L.SVG.create('g')
+        L.DomUtil.addClass(this._group, 'leaflet-zoom-hide') // Hide during zoom? No, we want it to scale.
+        // Actually, the renderer handles scaling of the root group.
+        // We just append to it.
+        
+        this._rootGroup.appendChild(this._group)
+        
+        this._update()
+        map.on('moveend zoomend', this._update, this)
+      },
+
+      onRemove: function(map) {
+        if (this._group && this._rootGroup) {
+          this._rootGroup.removeChild(this._group)
+        }
+        map.off('moveend zoomend', this._update, this)
+      },
+
+      _update: function() {
+        if (!this._map || !this._group) return
+        
+        // Clear existing
+        while (this._group.firstChild) {
+          this._group.removeChild(this._group.firstChild)
+        }
+
+        const bounds = this._map.getBounds()
+        const zoom = this._map.getZoom()
+        
+        // Simple viewport culling
+        // We can use the spatial index if we had one for text, but linear scan of 3MB might be ok-ish?
+        // 3MB json is maybe 10k items. 10k checks is fast.
+        
+        const features = data.features || []
+        const fragment = document.createDocumentFragment()
+        
+        // Dynamic font size based on zoom to reduce clutter
+        // 18 -> 9px, 19 -> 11px, 20 -> 13px, 21+ -> 15px+
+        const fontSize = Math.max(9, (zoom - 18) * 2 + 9)
+
+        for (const f of features) {
+          const coords = f.geometry.coordinates
+          const lat = coords[1]
+          const lng = coords[0]
+          
+          // Quick bounds check
+          if (!bounds.contains([lat, lng])) continue
+          
+          const pt = this._map.latLngToLayerPoint([lat, lng])
+          
+          const textNode = L.SVG.create('text')
+          textNode.textContent = f.properties.text
+          textNode.setAttribute('x', pt.x)
+          textNode.setAttribute('y', pt.y)
+          textNode.setAttribute('fill', '#94a3b8')
+          textNode.setAttribute('font-size', `${fontSize}px`)
+          textNode.setAttribute('font-family', 'sans-serif')
+          textNode.setAttribute('text-anchor', 'middle')
+          textNode.setAttribute('dominant-baseline', 'middle')
+          textNode.setAttribute('class', 'bg-text-svg')
+          // Add shadow for readability
+          textNode.setAttribute('style', 'text-shadow: 0 0 3px #0f172a; pointer-events: none;')
+          
+          if (f.properties.angle) {
+             // Rotate around the point
+             textNode.setAttribute('transform', `rotate(${f.properties.angle}, ${pt.x}, ${pt.y})`)
+          }
+          
+          fragment.appendChild(textNode)
+        }
+        
+        this._group.appendChild(fragment)
+      }
+    })
+
+    const l = new TextLayer()
+    map.addLayer(l)
+
+    return () => {
+      map.removeLayer(l)
+    }
+  }, [data, map])
+
+  return null
+})
+
+export default function PanelMap({ features, setFeatures, bgData, textData, beginUndoableAction, dataVersion }) {
   const hoverIdRef = React.useRef(null)
+  const [zoom, setZoom] = useState(17)
   const [, forceRender] = React.useState(0)
   const setHoverId = (id) => {
     hoverIdRef.current = id
@@ -436,11 +643,16 @@ export default function PanelMap({ features, setFeatures, bgData, beginUndoableA
     >
       <KillBrowserDefaults />
       <MiddleMousePan />
+      <ZoomHandler setZoom={setZoom} />
 
       {bgData && (
         <Pane name="bg" style={{ zIndex: 390 }}>
           <GeoJSON data={bgData} style={bgStyleFn} interactive={false} />
         </Pane>
+      )}
+
+      {textData && zoom >= 18 && (
+        <SvgTextLayer data={textData} />
       )}
 
       {features?.length > 0 && (
@@ -467,8 +679,8 @@ export default function PanelMap({ features, setFeatures, bgData, beginUndoableA
       {features?.length > 0 && (
         <>
           <MapHoverProximity setHoverId={setHoverId} features={features} spatialIndex={spatialIndex} />
-          <MapBrushUnified
-            setProgressForLine={setProgressForLine}
+          <MapBoxSelection
+            setFeatures={setFeatures}
             features={features}
             spatialIndex={spatialIndex}
             beginUndoableAction={beginUndoableAction}
