@@ -1,9 +1,8 @@
 import React, { useMemo, useRef, useCallback, useState } from 'react'
 import { MapContainer, GeoJSON, useMap, useMapEvent, Pane } from 'react-leaflet'
 import 'leaflet/dist/leaflet.css'
-import { bbox as turfBbox, point as turfPoint, nearestPointOnLine, lineSlice, length as turfLength, bboxClip } from '@turf/turf'
+import { bbox as turfBbox, point as turfPoint, nearestPointOnLine, lineSlice, length as turfLength, bboxClip, along as turfAlong } from '@turf/turf'
 import RBush from 'rbush'
-import { along as turfAlong } from '@turf/turf'
 import L from 'leaflet'
 
 const PIXEL_TOLERANCE = 15
@@ -397,9 +396,9 @@ function MapBoxSelection({ setFeatures, features, spatialIndex, beginUndoableAct
 }
 
 const bgStyleFn = () => ({
-  color: '#94a3b8', // Lighter slate (Slate 400) for better visibility on dark bg
+  color: '#000000', // Black lines
   weight: 1,
-  opacity: 0.3,
+  opacity: 1,
   lineCap: 'butt',
   className: 'bg-line',
   interactive: false
@@ -410,6 +409,27 @@ const textStyleFn = () => ({
   weight: 0.5,
   opacity: 0.3
 })
+
+const FENCE_COLORS = [
+  '#32CD32', // LimeGreen
+  '#FFA500', // Orange
+  '#1E90FF', // DodgerBlue
+  '#FFFF00', // Yellow
+  '#00FFFF', // Cyan
+  '#FF00FF', // Magenta
+]
+
+const fenceStyleFn = (feature) => {
+  const id = feature?.properties?.fid || feature?.properties?.handle || Math.floor(Math.random() * 10000)
+  const colorIndex = id % FENCE_COLORS.length
+  return {
+    color: FENCE_COLORS[colorIndex],
+    weight: 1,
+    opacity: 1,
+    lineCap: 'butt',
+    interactive: false
+  }
+}
 
 function DoneLayer({ features, version }) {
   const ref1 = React.useRef(null)
@@ -441,10 +461,6 @@ function DoneLayer({ features, version }) {
       ref1.current.clearLayers()
       if (doneGeoJSON) ref1.current.addData(doneGeoJSON)
     }
-    if (ref2.current) {
-      ref2.current.clearLayers()
-      if (doneGeoJSON) ref2.current.addData(doneGeoJSON)
-    }
   }, [doneGeoJSON])
 
   return (
@@ -453,20 +469,9 @@ function DoneLayer({ features, version }) {
         ref={ref1}
         data={null}
         style={{
-          color: '#059669',
-          weight: 12,
-          opacity: 0.4,
-          lineCap: 'round'
-        }}
-        interactive={false}
-      />
-      <GeoJSON
-        ref={ref2}
-        data={null}
-        style={{
-          color: '#10b981',
-          weight: 6,
-          opacity: 1,
+          color: '#22c55e', // Solid Green
+          weight: 3,        // Matching the red lines thickness roughly (maybe slightly thicker)
+          opacity: 1,       // Solid, no transparency
           lineCap: 'round'
         }}
         interactive={false}
@@ -474,6 +479,103 @@ function DoneLayer({ features, version }) {
     </Pane>
   )
 }
+
+const FenceLayer = React.memo(({ data, zoom }) => {
+  const processedData = useMemo(() => {
+    if (!data || !data.features) return null
+    const chunks = []
+    let globalIndex = 0
+    
+    for (const f of data.features) {
+      if (!f.geometry || f.geometry.type !== 'LineString') {
+        if (f.geometry?.type === 'MultiLineString') {
+           chunks.push({ ...f, properties: { ...f.properties, colorIndex: globalIndex++ } })
+        } else {
+           chunks.push({ ...f, properties: { ...f.properties, colorIndex: globalIndex++ } })
+        }
+        continue
+      }
+
+      const len = turfLength(f, { units: 'kilometers' })
+      const segmentLen = 0.1 // 100 meters
+      
+      if (len <= segmentLen) {
+        chunks.push({ ...f, properties: { ...f.properties, colorIndex: globalIndex++ } })
+      } else {
+        const numSegments = Math.ceil(len / segmentLen)
+        for (let i = 0; i < numSegments; i++) {
+          const startDist = i * segmentLen
+          const endDist = Math.min((i + 1) * segmentLen, len)
+          
+          try {
+            const startPt = turfAlong(f, startDist, { units: 'kilometers' })
+            const endPt = turfAlong(f, endDist, { units: 'kilometers' })
+            const slice = lineSlice(startPt, endPt, f)
+            
+            chunks.push({
+              ...slice,
+              properties: {
+                ...f.properties,
+                colorIndex: globalIndex++ 
+              }
+            })
+          } catch (e) {
+            console.warn('Error slicing fence:', e)
+          }
+        }
+      }
+    }
+    return { type: 'FeatureCollection', features: chunks }
+  }, [data])
+
+  if (!processedData) return null
+
+  const rainbow = [
+    "#FF0000", // Neon Red
+    "#FF4500", // Neon Orange Red
+    "#FFD700", // Neon Gold
+    "#32CD32", // Neon Lime Green
+    "#00FF00", // Neon Green
+    "#00FFFF", // Neon Cyan
+    "#1E90FF", // Neon Dodger Blue
+    "#0000FF", // Neon Blue
+    "#8A2BE2", // Neon Blue Violet
+    "#FF00FF", // Neon Magenta
+    "#FF1493"  // Neon Deep Pink
+  ]
+
+  return (
+    <Pane name="bg-fence" style={{ zIndex: 391 }}>
+      <GeoJSON 
+        data={processedData} 
+        style={(feature) => {
+          const str = (feature?.properties && Object.keys(feature.properties).length > 0) 
+            ? JSON.stringify(feature.properties) 
+            : JSON.stringify(feature?.geometry || Math.random())
+            
+          let hash = 0
+          for (let i = 0; i < str.length; i++) {
+            hash = str.charCodeAt(i) + ((hash << 5) - hash)
+          }
+          
+          const color = rainbow[Math.abs(hash) % rainbow.length]
+          
+          // Dynamic weight based on zoom to prevent clutter
+          const weight = zoom < 16 ? 1 : (zoom < 18 ? 2 : 3)
+
+          return {
+            color: color,
+            weight: weight,
+            opacity: 1,
+            lineCap: 'butt',
+            interactive: false
+          }
+        }} 
+        interactive={false} 
+      />
+    </Pane>
+  )
+})
 
 function ZoomHandler({ setZoom }) {
   const map = useMap()
@@ -561,14 +663,14 @@ const SvgTextLayer = React.memo(({ data }) => {
           textNode.textContent = f.properties.text
           textNode.setAttribute('x', pt.x)
           textNode.setAttribute('y', pt.y)
-          textNode.setAttribute('fill', '#94a3b8')
+          textNode.setAttribute('fill', '#000000') // Black text
           textNode.setAttribute('font-size', `${fontSize}px`)
           textNode.setAttribute('font-family', 'sans-serif')
           textNode.setAttribute('text-anchor', 'middle')
           textNode.setAttribute('dominant-baseline', 'middle')
           textNode.setAttribute('class', 'bg-text-svg')
-          // Add shadow for readability
-          textNode.setAttribute('style', 'text-shadow: 0 0 3px #0f172a; pointer-events: none;')
+          // Add white shadow for readability on black lines
+          textNode.setAttribute('style', 'text-shadow: 0 0 3px #ffffff; pointer-events: none;')
           
           if (f.properties.angle) {
              // Rotate around the point
@@ -593,7 +695,7 @@ const SvgTextLayer = React.memo(({ data }) => {
   return null
 })
 
-export default function PanelMap({ features, setFeatures, bgData, textData, beginUndoableAction, dataVersion }) {
+export default function PanelMap({ features, setFeatures, bgData, textData, fenceData, beginUndoableAction, dataVersion }) {
   const hoverIdRef = React.useRef(null)
   const [zoom, setZoom] = useState(17)
   const [, forceRender] = React.useState(0)
@@ -639,7 +741,7 @@ export default function PanelMap({ features, setFeatures, bgData, textData, begi
       center={[52.6, -1.7]}
       zoom={17}
       zoomControl={false}
-      style={{ height: '100%', width: '100%', background: '#0f172a' }}
+      style={{ height: '100%', width: '100%', background: '#eef2f6' }}
     >
       <KillBrowserDefaults />
       <MiddleMousePan />
@@ -649,6 +751,10 @@ export default function PanelMap({ features, setFeatures, bgData, textData, begi
         <Pane name="bg" style={{ zIndex: 390 }}>
           <GeoJSON data={bgData} style={bgStyleFn} interactive={false} />
         </Pane>
+      )}
+
+      {fenceData && (
+        <FenceLayer data={fenceData} zoom={zoom} />
       )}
 
       {textData && zoom >= 18 && (
@@ -662,9 +768,9 @@ export default function PanelMap({ features, setFeatures, bgData, textData, begi
             style={(f) => {
               const isHover = hoverIdRef.current && f.properties.id === hoverIdRef.current
               return {
-                color: isHover ? '#ffffff' : '#f5f5f5',
-                weight: isHover ? 1.6 : 1.05,
-                opacity: isHover ? 1 : 0.88,
+                color: isHover ? '#ff8888' : '#ef4444', // Red for "to do" trenches
+                weight: isHover ? 2.5 : 1.5,
+                opacity: isHover ? 1 : 0.9,
                 lineCap: 'butt',
                 lineJoin: 'round'
               }

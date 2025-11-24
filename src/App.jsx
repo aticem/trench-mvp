@@ -88,10 +88,13 @@ export default function App() {
   const [features, setFeatures] = useState([])
   const [bgData, setBgData] = useState(null)
   const [textData, setTextData] = useState(null)
+  const [fenceData, setFenceData] = useState(null)
   const [dataVersion, setDataVersion] = useState(0)
   const [isSubmitOpen, setSubmitOpen] = useState(false)
   const [undoStack, setUndoStack] = useState([])
   const [undoCount, setUndoCount] = useState(0)
+  const [redoStack, setRedoStack] = useState([])
+  const [redoCount, setRedoCount] = useState(0)
 
   const { dailyLog, addRecord } = useDailyLog()
   const { exportToExcel } = useChartExport()
@@ -105,6 +108,8 @@ export default function App() {
       setUndoCount(next.length)
       return next
     })
+    setRedoStack([])
+    setRedoCount(0)
   }, [])
 
   const undoLast = useCallback(() => {
@@ -113,10 +118,37 @@ export default function App() {
       const next = [...prev]
       const snapshot = next.pop()
       setUndoCount(next.length)
-      if (snapshot) setFeatures(snapshot)
+      
+      if (snapshot) {
+        setRedoStack(prevRedo => {
+          const nextRedo = [...prevRedo, cloneData(features)]
+          setRedoCount(nextRedo.length)
+          return nextRedo
+        })
+        setFeatures(snapshot)
+      }
       return next
     })
-  }, [])
+  }, [features])
+
+  const redoLast = useCallback(() => {
+    setRedoStack(prev => {
+      if (!prev.length) return prev
+      const next = [...prev]
+      const snapshot = next.pop()
+      setRedoCount(next.length)
+
+      if (snapshot) {
+        setUndoStack(prevUndo => {
+          const nextUndo = [...prevUndo, cloneData(features)]
+          setUndoCount(nextUndo.length)
+          return nextUndo
+        })
+        setFeatures(snapshot)
+      }
+      return next
+    })
+  }, [features])
 
   const beginUndoableAction = useCallback(() => {
     if (!features.length) return
@@ -159,6 +191,14 @@ export default function App() {
         setTextData(j)
       })
       .catch(err => console.error('Failed to load text layer:', err))
+
+    fetch('/fence lines.geojson')
+      .then(r => r.json())
+      .then(j => {
+        console.log('Fence layer loaded:', j.features?.length)
+        setFenceData(j)
+      })
+      .catch(err => console.error('Failed to load fence layer:', err))
   }, [])
 
   useEffect(() => {
@@ -173,10 +213,14 @@ export default function App() {
         e.preventDefault()
         undoLast()
       }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
+        e.preventDefault()
+        redoLast()
+      }
     }
     window.addEventListener('keydown', handleKey)
     return () => window.removeEventListener('keydown', handleKey)
-  }, [undoLast])
+  }, [undoLast, redoLast])
 
   const summary = useMemo(() => {
     let total = 0, completed = 0
@@ -192,7 +236,8 @@ export default function App() {
       for (const [a, b] of ranges) ratio += (b - a)
       completed += meters * Math.min(1, ratio)
     }
-    return { total, completed, remaining: total - completed }
+    const percentage = total > 0 ? (completed / total) * 100 : 0
+    return { total, completed, remaining: total - completed, percentage }
   }, [features])
 
   const clearAll = () => {
@@ -213,12 +258,12 @@ export default function App() {
 
   return (
     <>
-      <div style={{ height: '100vh', width: '100vw', display: 'flex', flexDirection: 'column', background: '#0b1220', color: '#e5e7eb' }}>
+      <div style={{ height: '100vh', width: '100%', display: 'flex', flexDirection: 'column', background: '#0b1220', color: '#e5e7eb' }}>
         <header style={{
           display: 'flex',
           alignItems: 'center',
           gap: 24,
-          padding: '12px 24px',
+          padding: '6px 24px',
           background: '#081122',
           borderBottom: '1px solid #111b2f'
         }}>
@@ -226,8 +271,11 @@ export default function App() {
             total={summary.total}
             completed={summary.completed}
             remaining={summary.remaining}
+            percentage={summary.percentage}
             onUndo={undoLast}
             undoDisabled={!undoCount}
+            onRedo={redoLast}
+            redoDisabled={!redoCount}
           />
           <h1 style={{
             flex: 1,
@@ -294,7 +342,8 @@ export default function App() {
             setFeatures={setFeatures}
             bgData={bgData}
             textData={textData}
-            beginUndoableAction={beginUndoableAction}
+            fenceData={fenceData}
+            beginUndoableAction={() => pushUndoSnapshot(features)}
             dataVersion={dataVersion}
           />
         </div>
